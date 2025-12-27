@@ -7,7 +7,6 @@ WORKDIR /app
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV TRANSPORT=http
 ENV PORT=7860
 
 # Install system dependencies
@@ -27,5 +26,5 @@ COPY . .
 # Expose port (Hugging Face uses 7860)
 EXPOSE 7860
 
-# Run FastMCP directly with HTTP transport
-CMD ["python", "-c", "from main import mcp; import os; mcp.run(transport='http', host='0.0.0.0', port=int(os.getenv('PORT', 7860)))"]
+# Run the FastAPI server
+CMD ["python", "app.py"]
