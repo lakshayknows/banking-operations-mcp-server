@@ -27,5 +27,5 @@ COPY . .
 # Expose port (Hugging Face uses 7860)
 EXPOSE 7860
 
-# Run the FastAPI wrapper with landing page
-CMD ["python", "app.py"]
+# Run FastMCP directly with HTTP transport
+CMD ["python", "-c", "from main import mcp; import os; mcp.run(transport='http', host='0.0.0.0', port=int(os.getenv('PORT', 7860)))"]
