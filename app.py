@@ -1,17 +1,19 @@
-# MCP Banking Server - FastAPI with REST Endpoints
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+# MCP Banking Server - Combined FastAPI + MCP Protocol
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Any
 import sqlite3
 import os
 import uvicorn
+import json
+import asyncio
 
 # Create FastAPI app
 app = FastAPI(
     title="MCP Banking Server",
-    description="A banking API server with account management, deposits, withdrawals, and transaction history",
+    description="A banking API server with MCP protocol support",
     version="1.0.0"
 )
 
@@ -66,21 +68,282 @@ def init_database():
 init_database()
 
 
-# Pydantic Models
-class AccountCreate(BaseModel):
-    name: str = Field(..., min_length=1, description="Account holder's name")
-    email: str = Field(..., description="Account holder's email")
-    initial_deposit: float = Field(default=0.0, ge=0, description="Initial deposit amount")
+# MCP Protocol - Tool Definitions
+MCP_TOOLS = [
+    {
+        "name": "create_account",
+        "description": "Create a new bank account with name, email, and optional initial deposit",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Account holder's name"},
+                "email": {"type": "string", "description": "Account holder's email"},
+                "initial_deposit": {"type": "number", "description": "Initial deposit amount", "default": 0}
+            },
+            "required": ["name", "email"]
+        }
+    },
+    {
+        "name": "deposit",
+        "description": "Deposit funds into a bank account",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "integer", "description": "Account ID"},
+                "amount": {"type": "number", "description": "Amount to deposit"},
+                "description": {"type": "string", "description": "Transaction description"}
+            },
+            "required": ["account_id", "amount"]
+        }
+    },
+    {
+        "name": "withdraw",
+        "description": "Withdraw funds from a bank account",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "integer", "description": "Account ID"},
+                "amount": {"type": "number", "description": "Amount to withdraw"},
+                "description": {"type": "string", "description": "Transaction description"}
+            },
+            "required": ["account_id", "amount"]
+        }
+    },
+    {
+        "name": "get_balance",
+        "description": "Get the current balance of a bank account",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "integer", "description": "Account ID"}
+            },
+            "required": ["account_id"]
+        }
+    },
+    {
+        "name": "get_transactions",
+        "description": "Get transaction history for a bank account",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "integer", "description": "Account ID"},
+                "limit": {"type": "integer", "description": "Max transactions to return", "default": 10}
+            },
+            "required": ["account_id"]
+        }
+    },
+    {
+        "name": "list_accounts",
+        "description": "List all active bank accounts",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max accounts to return", "default": 10}
+            }
+        }
+    }
+]
 
 
-class DepositRequest(BaseModel):
-    amount: float = Field(..., gt=0, description="Amount to deposit")
-    description: Optional[str] = Field(default="Deposit", description="Transaction description")
+# Tool Implementation Functions
+def execute_create_account(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id FROM accounts WHERE email = ?", (args["email"],))
+        if cursor.fetchone():
+            return {"error": "Account with this email already exists"}
+        
+        initial_deposit = args.get("initial_deposit", 0)
+        cursor.execute(
+            "INSERT INTO accounts (name, email, balance, is_active) VALUES (?, ?, ?, 1)",
+            (args["name"], args["email"], initial_deposit)
+        )
+        account_id = cursor.lastrowid
+        
+        if initial_deposit > 0:
+            cursor.execute(
+                "INSERT INTO transactions (account_id, transaction_type, amount, balance_after, description) VALUES (?, ?, ?, ?, ?)",
+                (account_id, "deposit", initial_deposit, initial_deposit, "Initial deposit")
+            )
+        conn.commit()
+        return {"success": True, "account_id": account_id, "name": args["name"], "balance": initial_deposit}
+    finally:
+        conn.close()
 
 
-class WithdrawRequest(BaseModel):
-    amount: float = Field(..., gt=0, description="Amount to withdraw")
-    description: Optional[str] = Field(default="Withdrawal", description="Transaction description")
+def execute_deposit(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id, balance FROM accounts WHERE id = ?", (args["account_id"],))
+        account = cursor.fetchone()
+        if not account:
+            return {"error": "Account not found"}
+        
+        new_balance = account["balance"] + args["amount"]
+        cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_balance, args["account_id"]))
+        cursor.execute(
+            "INSERT INTO transactions (account_id, transaction_type, amount, balance_after, description) VALUES (?, ?, ?, ?, ?)",
+            (args["account_id"], "deposit", args["amount"], new_balance, args.get("description", "Deposit"))
+        )
+        conn.commit()
+        return {"success": True, "new_balance": new_balance}
+    finally:
+        conn.close()
+
+
+def execute_withdraw(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id, balance FROM accounts WHERE id = ?", (args["account_id"],))
+        account = cursor.fetchone()
+        if not account:
+            return {"error": "Account not found"}
+        if args["amount"] > account["balance"]:
+            return {"error": f"Insufficient funds. Balance: ${account['balance']:.2f}"}
+        
+        new_balance = account["balance"] - args["amount"]
+        cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_balance, args["account_id"]))
+        cursor.execute(
+            "INSERT INTO transactions (account_id, transaction_type, amount, balance_after, description) VALUES (?, ?, ?, ?, ?)",
+            (args["account_id"], "withdrawal", args["amount"], new_balance, args.get("description", "Withdrawal"))
+        )
+        conn.commit()
+        return {"success": True, "new_balance": new_balance}
+    finally:
+        conn.close()
+
+
+def execute_get_balance(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id, name, balance FROM accounts WHERE id = ?", (args["account_id"],))
+        account = cursor.fetchone()
+        if not account:
+            return {"error": "Account not found"}
+        return {"account_id": account["id"], "name": account["name"], "balance": account["balance"]}
+    finally:
+        conn.close()
+
+
+def execute_get_transactions(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        limit = args.get("limit", 10)
+        cursor.execute(
+            "SELECT * FROM transactions WHERE account_id = ? ORDER BY timestamp DESC LIMIT ?",
+            (args["account_id"], limit)
+        )
+        return {"transactions": [dict(row) for row in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+
+def execute_list_accounts(args):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        limit = args.get("limit", 10)
+        cursor.execute("SELECT * FROM accounts WHERE is_active = 1 LIMIT ?", (limit,))
+        return {"accounts": [dict(row) for row in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+
+TOOL_EXECUTORS = {
+    "create_account": execute_create_account,
+    "deposit": execute_deposit,
+    "withdraw": execute_withdraw,
+    "get_balance": execute_get_balance,
+    "get_transactions": execute_get_transactions,
+    "list_accounts": execute_list_accounts
+}
+
+
+# MCP Protocol Endpoints
+@app.get("/mcp/tools")
+async def mcp_list_tools():
+    """List all available MCP tools"""
+    return {"tools": MCP_TOOLS}
+
+
+@app.post("/mcp/tools/call")
+async def mcp_call_tool(request: Request):
+    """Call an MCP tool"""
+    body = await request.json()
+    tool_name = body.get("name")
+    arguments = body.get("arguments", {})
+    
+    if tool_name not in TOOL_EXECUTORS:
+        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
+    
+    result = TOOL_EXECUTORS[tool_name](arguments)
+    return {"result": result}
+
+
+# MCP JSON-RPC endpoint (for protocol compliance)
+@app.post("/mcp")
+async def mcp_jsonrpc(request: Request):
+    """MCP JSON-RPC endpoint for protocol compliance"""
+    try:
+        body = await request.json()
+    except:
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "error": {"code": -32700, "message": "Parse error"},
+            "id": None
+        })
+    
+    method = body.get("method", "")
+    params = body.get("params", {})
+    req_id = body.get("id", 1)
+    
+    if method == "initialize":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "MCP Banking Server", "version": "1.0.0"}
+            },
+            "id": req_id
+        })
+    
+    elif method == "tools/list":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "result": {"tools": MCP_TOOLS},
+            "id": req_id
+        })
+    
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+        
+        if tool_name not in TOOL_EXECUTORS:
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "error": {"code": -32601, "message": f"Tool '{tool_name}' not found"},
+                "id": req_id
+            })
+        
+        result = TOOL_EXECUTORS[tool_name](arguments)
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "result": {"content": [{"type": "text", "text": json.dumps(result)}]},
+            "id": req_id
+        })
+    
+    else:
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "error": {"code": -32601, "message": f"Method '{method}' not found"},
+            "id": req_id
+        })
 
 
 # Landing Page
@@ -114,70 +377,46 @@ async def root():
             }
             .emoji { font-size: 4rem; margin-bottom: 20px; }
             p { font-size: 1.2rem; color: #a0a0a0; margin-bottom: 30px; }
-            .endpoints { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin: 30px 0; }
-            .endpoint {
+            .tools { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 30px 0; }
+            .tool {
                 background: rgba(255,255,255,0.05);
                 border: 1px solid rgba(255,255,255,0.1);
                 border-radius: 10px;
                 padding: 20px;
-                text-align: left;
             }
-            .method { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: bold; }
-            .post { background: #2ecc71; color: #fff; }
-            .get { background: #3498db; color: #fff; }
-            .path { color: #00d4ff; font-family: monospace; margin: 10px 0; }
-            .desc { color: #a0a0a0; font-size: 0.9rem; }
-            .docs { margin-top: 30px; }
-            .docs a { color: #00d4ff; text-decoration: none; margin: 0 15px; }
+            .tool h3 { color: #00d4ff; margin-bottom: 10px; }
+            .tool p { font-size: 0.9rem; margin: 0; }
+            .endpoints { margin-top: 30px; }
+            .endpoints code { background: rgba(0,212,255,0.2); padding: 8px 15px; border-radius: 5px; margin: 5px; display: inline-block; }
+            .links { margin-top: 30px; }
+            .links a { color: #00d4ff; text-decoration: none; margin: 0 15px; }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="emoji">🏦</div>
             <h1>MCP Banking Server</h1>
-            <p>FastAPI Banking Server with REST Endpoints for AI Agents</p>
+            <p>Banking operations via MCP Protocol</p>
             
-            <div class="endpoints">
-                <div class="endpoint">
-                    <span class="method post">POST</span>
-                    <div class="path">/accounts</div>
-                    <div class="desc">Create a new bank account</div>
-                </div>
-                <div class="endpoint">
-                    <span class="method get">GET</span>
-                    <div class="path">/accounts</div>
-                    <div class="desc">List all accounts</div>
-                </div>
-                <div class="endpoint">
-                    <span class="method get">GET</span>
-                    <div class="path">/accounts/{id}</div>
-                    <div class="desc">Get account details</div>
-                </div>
-                <div class="endpoint">
-                    <span class="method post">POST</span>
-                    <div class="path">/accounts/{id}/deposit</div>
-                    <div class="desc">Deposit funds</div>
-                </div>
-                <div class="endpoint">
-                    <span class="method post">POST</span>
-                    <div class="path">/accounts/{id}/withdraw</div>
-                    <div class="desc">Withdraw funds</div>
-                </div>
-                <div class="endpoint">
-                    <span class="method get">GET</span>
-                    <div class="path">/accounts/{id}/balance</div>
-                    <div class="desc">Check balance</div>
-                </div>
-                <div class="endpoint">
-                    <span class="method get">GET</span>
-                    <div class="path">/accounts/{id}/transactions</div>
-                    <div class="desc">Transaction history</div>
-                </div>
+            <div class="tools">
+                <div class="tool"><h3>create_account</h3><p>Create new account</p></div>
+                <div class="tool"><h3>deposit</h3><p>Deposit funds</p></div>
+                <div class="tool"><h3>withdraw</h3><p>Withdraw funds</p></div>
+                <div class="tool"><h3>get_balance</h3><p>Check balance</p></div>
+                <div class="tool"><h3>get_transactions</h3><p>Transaction history</p></div>
+                <div class="tool"><h3>list_accounts</h3><p>List accounts</p></div>
             </div>
             
-            <div class="docs">
-                <a href="/docs">📚 API Docs (Swagger)</a>
-                <a href="/redoc">📖 ReDoc</a>
+            <div class="endpoints">
+                <p>MCP Endpoints:</p>
+                <code>POST /mcp</code>
+                <code>GET /mcp/tools</code>
+                <code>POST /mcp/tools/call</code>
+            </div>
+            
+            <div class="links">
+                <a href="/mcp/tools">📋 View Tools</a>
+                <a href="/docs">📚 API Docs</a>
                 <a href="https://github.com/lakshayknows/banking-operations-mcp-server">📦 GitHub</a>
             </div>
         </div>
@@ -188,193 +427,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "MCP Banking Server"}
-
-
-# ==================== ACCOUNT ENDPOINTS ====================
-
-@app.post("/accounts", tags=["Accounts"])
-async def create_account(account: AccountCreate):
-    """Create a new bank account with name, email, and optional initial deposit."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("SELECT id FROM accounts WHERE email = ?", (account.email,))
-        if cursor.fetchone():
-            raise HTTPException(status_code=400, detail="Account with this email already exists")
-        
-        cursor.execute(
-            "INSERT INTO accounts (name, email, balance, is_active) VALUES (?, ?, ?, 1)",
-            (account.name, account.email, account.initial_deposit)
-        )
-        account_id = cursor.lastrowid
-        
-        if account.initial_deposit > 0:
-            cursor.execute(
-                "INSERT INTO transactions (account_id, transaction_type, amount, balance_after, description) VALUES (?, ?, ?, ?, ?)",
-                (account_id, "deposit", account.initial_deposit, account.initial_deposit, "Initial deposit")
-            )
-        
-        conn.commit()
-        return {
-            "success": True,
-            "account_id": account_id,
-            "name": account.name,
-            "email": account.email,
-            "balance": account.initial_deposit
-        }
-    finally:
-        conn.close()
-
-
-@app.get("/accounts", tags=["Accounts"])
-async def list_accounts(limit: int = 10):
-    """List all active bank accounts."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("SELECT * FROM accounts WHERE is_active = 1 LIMIT ?", (limit,))
-        accounts = [dict(row) for row in cursor.fetchall()]
-        return {"accounts": accounts, "count": len(accounts)}
-    finally:
-        conn.close()
-
-
-@app.get("/accounts/{account_id}", tags=["Accounts"])
-async def get_account(account_id: int):
-    """Get details of a specific account."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
-        account = cursor.fetchone()
-        if not account:
-            raise HTTPException(status_code=404, detail="Account not found")
-        return dict(account)
-    finally:
-        conn.close()
-
-
-@app.get("/accounts/{account_id}/balance", tags=["Accounts"])
-async def get_balance(account_id: int):
-    """Get the current balance of an account."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("SELECT id, name, balance FROM accounts WHERE id = ?", (account_id,))
-        account = cursor.fetchone()
-        if not account:
-            raise HTTPException(status_code=404, detail="Account not found")
-        return {
-            "account_id": account["id"],
-            "name": account["name"],
-            "balance": account["balance"],
-            "currency": "USD"
-        }
-    finally:
-        conn.close()
-
-
-# ==================== TRANSACTION ENDPOINTS ====================
-
-@app.post("/accounts/{account_id}/deposit", tags=["Transactions"])
-async def deposit(account_id: int, request: DepositRequest):
-    """Deposit funds into an account."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("SELECT id, balance, is_active FROM accounts WHERE id = ?", (account_id,))
-        account = cursor.fetchone()
-        
-        if not account:
-            raise HTTPException(status_code=404, detail="Account not found")
-        if not account["is_active"]:
-            raise HTTPException(status_code=400, detail="Account is inactive")
-        
-        new_balance = account["balance"] + request.amount
-        cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_balance, account_id))
-        cursor.execute(
-            "INSERT INTO transactions (account_id, transaction_type, amount, balance_after, description) VALUES (?, ?, ?, ?, ?)",
-            (account_id, "deposit", request.amount, new_balance, request.description)
-        )
-        
-        conn.commit()
-        return {
-            "success": True,
-            "transaction_type": "deposit",
-            "amount": request.amount,
-            "new_balance": new_balance
-        }
-    finally:
-        conn.close()
-
-
-@app.post("/accounts/{account_id}/withdraw", tags=["Transactions"])
-async def withdraw(account_id: int, request: WithdrawRequest):
-    """Withdraw funds from an account."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("SELECT id, balance, is_active FROM accounts WHERE id = ?", (account_id,))
-        account = cursor.fetchone()
-        
-        if not account:
-            raise HTTPException(status_code=404, detail="Account not found")
-        if not account["is_active"]:
-            raise HTTPException(status_code=400, detail="Account is inactive")
-        if request.amount > account["balance"]:
-            raise HTTPException(status_code=400, detail=f"Insufficient funds. Balance: ${account['balance']:.2f}")
-        
-        new_balance = account["balance"] - request.amount
-        cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_balance, account_id))
-        cursor.execute(
-            "INSERT INTO transactions (account_id, transaction_type, amount, balance_after, description) VALUES (?, ?, ?, ?, ?)",
-            (account_id, "withdrawal", request.amount, new_balance, request.description)
-        )
-        
-        conn.commit()
-        return {
-            "success": True,
-            "transaction_type": "withdrawal",
-            "amount": request.amount,
-            "new_balance": new_balance
-        }
-    finally:
-        conn.close()
-
-
-@app.get("/accounts/{account_id}/transactions", tags=["Transactions"])
-async def get_transactions(account_id: int, limit: int = 10):
-    """Get transaction history for an account."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("SELECT id, name FROM accounts WHERE id = ?", (account_id,))
-        account = cursor.fetchone()
-        if not account:
-            raise HTTPException(status_code=404, detail="Account not found")
-        
-        cursor.execute(
-            "SELECT * FROM transactions WHERE account_id = ? ORDER BY timestamp DESC LIMIT ?",
-            (account_id, limit)
-        )
-        transactions = [dict(row) for row in cursor.fetchall()]
-        
-        return {
-            "account_id": account_id,
-            "account_name": account["name"],
-            "transactions": transactions,
-            "count": len(transactions)
-        }
-    finally:
-        conn.close()
+    return {"status": "healthy", "service": "MCP Banking Server", "tools_count": len(MCP_TOOLS)}
 
 
 if __name__ == "__main__":
