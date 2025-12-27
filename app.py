@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Any
 import sqlite3
 import os
+from fastapi.security import APIKeyHeader
+from fastapi import Security, HTTPException, status, Depends
 import uvicorn
 import json
 import asyncio
@@ -16,6 +18,21 @@ app = FastAPI(
     description="A banking API server with MCP protocol support",
     version="1.0.0"
 )
+
+# Security
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def get_api_key(api_key_header: str = Security(api_key_header)):
+    # Allow access to docs and root without key, but protect API endpoints
+    # For this assignment, we use a default key if not set
+    expected_key = os.getenv("API_KEY", "mcp-demo-key")
+    if api_key_header == expected_key:
+        return api_key_header
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing API Key",
+    )
 
 # CORS
 app.add_middleware(
@@ -202,7 +219,7 @@ def execute_withdraw(args):
         if not account:
             return {"error": "Account not found"}
         if args["amount"] > account["balance"]:
-            return {"error": f"Insufficient funds. Balance: ${account['balance']:.2f}"}
+            return {"error": "Insufficient funds. Balance: $" + format(account['balance'], ".2f")}
         
         new_balance = account["balance"] - args["amount"]
         cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_balance, args["account_id"]))
@@ -265,13 +282,13 @@ TOOL_EXECUTORS = {
 
 
 # MCP Protocol Endpoints
-@app.get("/mcp/tools")
+@app.get("/mcp/tools", dependencies=[Depends(get_api_key)])
 async def mcp_list_tools():
     """List all available MCP tools"""
     return {"tools": MCP_TOOLS}
 
 
-@app.post("/mcp/tools/call")
+@app.post("/mcp/tools/call", dependencies=[Depends(get_api_key)])
 async def mcp_call_tool(request: Request):
     """Call an MCP tool"""
     body = await request.json()
@@ -286,7 +303,7 @@ async def mcp_call_tool(request: Request):
 
 
 # MCP JSON-RPC endpoint (for protocol compliance)
-@app.post("/mcp")
+@app.post("/mcp", dependencies=[Depends(get_api_key)])
 async def mcp_jsonrpc(request: Request):
     """MCP JSON-RPC endpoint for protocol compliance"""
     try:
