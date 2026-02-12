@@ -1,12 +1,3 @@
----
-title: MCP Banking Server
-emoji: 🏦
-colorFrom: blue
-colorTo: green
-sdk: docker
-pinned: false
----
-
 # 🏦 MCP Banking Server
 
 A secure **Model Context Protocol (MCP)** server built with FastAPI that provides banking operations. This server exposes banking tools that can be used by AI agents like Claude, GPT, and other MCP-compatible clients.
